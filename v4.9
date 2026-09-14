@@ -1,0 +1,1573 @@
+// ==UserScript==
+// @name         Endstep.cc Log Tracker per IA V4.9 BO3 Match Tracker
+// @namespace    http://tampermonkey.net/
+// @version      0.9
+// @description  Tracker automatico Endstep.cc: Game + Match BO3, archivio persistente e risultati automatici
+// @author       Tu
+// @match        *://endstep.cc/*
+// @match        *://*.endstep.cc/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /******************************************************************
+     * CONFIG
+     ******************************************************************/
+
+    const ARCHIVE_KEY = 'endstep_ai_matches_v49';
+    const CURRENT_KEY = 'endstep_ai_match_current_v49';
+    const POSITION_KEY = 'endstep_ai_panel_position_v49';
+
+    const PANEL_ID = 'endstep-ai-tracker-v49';
+    const FORMAT = 'BO3';
+    const MAX_GAME_WINS = 2;
+
+    let logContainer = null;
+    let observer = null;
+
+    let currentMatch = null;
+    let currentGame = null;
+    let matchCounter = 0;
+    let gameCounter = 0;
+
+    let knownRows = new WeakSet();
+    let knownPhases = new WeakSet();
+
+    let initialized = false;
+    let restoredExistingSession = false;
+    let currentTurn = null;
+    let turnAnchorBase = 0;
+
+    let playerName = null;
+    let opponentName = null;
+
+    /******************************************************************
+     * UTILS
+     ******************************************************************/
+
+    function nowISO() {
+        return new Date().toISOString();
+    }
+
+    /*
+     * FIX v4.5:
+     * localStorage.getItem() ritorna null (non lancia eccezione)
+     * quando la chiave non esiste ancora. JSON.parse(null) NON va
+     * in errore: interpreta null come la stringa "null" e la
+     * parsa con successo, restituendo null come valore valido.
+     * Il fallback quindi non scattava mai in questo caso, solo
+     * per JSON davvero malformato: chi chiamava safeParse si
+     * ritrovava null al posto dell'oggetto/array di default,
+     * causando crash a catena (createPanel, archiveCurrentGame, ecc.)
+     * ad ogni ciclo di mainLoop() quando una chiave non era ancora
+     * mai stata scritta in questo browser/profilo.
+     */
+    function safeParse(value, fallback) {
+        if (value === null || value === undefined) {
+            return fallback;
+        }
+
+        try {
+            return JSON.parse(value);
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function normalizeText(text) {
+        return String(text || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function loadArchive() {
+        return safeParse(localStorage.getItem(ARCHIVE_KEY), []);
+    }
+
+    function saveArchive(archive) {
+        try {
+            localStorage.setItem(ARCHIVE_KEY, JSON.stringify(archive));
+            flagSaveError(false);
+        } catch (e) {
+            console.error('[Endstep V4.9] Errore salvataggio archivio:', e);
+            flagSaveError(true);
+        }
+    }
+
+    function getArchiveCount() { return loadArchive().length; }
+
+    /******************************************************************
+     * MATCH + GAME OBJECTS
+     ******************************************************************/
+
+    function generateId(prefix = 'id') {
+        return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    function generateGameId() {
+        return generateId('game');
+    }
+
+    function generateMatchId() {
+        return generateId('match');
+    }
+
+    function createMatch() {
+        matchCounter++;
+        return {
+            schemaVersion: '4.9',
+            localMatchId: generateMatchId(),
+            createdAt: nowISO(),
+            updatedAt: nowISO(),
+            source: 'endstep.cc',
+            matchNumber: matchCounter,
+            format: FORMAT,
+            player: null,
+            opponent: null,
+            games: [],
+            score: { player: 0, opponent: 0 },
+            result: null,
+            status: 'in_progress',
+            metadata: {
+                url: location.href,
+                title: document.title || '',
+                userAgent: navigator.userAgent
+            }
+        };
+    }
+
+    function createGame(gameNumber = 1) {
+        gameCounter++;
+        return {
+            schemaVersion: '4.9',
+            localGameId: generateGameId(),
+            createdAt: nowISO(),
+            updatedAt: nowISO(),
+            source: 'endstep.cc',
+            gameNumber,
+            player: null,
+            opponent: null,
+            firstPlayer: null,
+            result: null,
+            status: 'in_progress',
+            turns: 0,
+            events: [],
+            metadata: {
+                url: location.href,
+                title: document.title || '',
+                userAgent: navigator.userAgent
+            },
+            turnAnchorBase: 0
+        };
+    }
+
+    function ensureCurrentGameInMatch() {
+        if (!currentMatch || !currentGame) return;
+        const index = currentMatch.games.findIndex(g => g.localGameId === currentGame.localGameId);
+        if (index >= 0) currentMatch.games[index] = currentGame;
+        else currentMatch.games.push(currentGame);
+        currentMatch.updatedAt = nowISO();
+        currentMatch.player = currentMatch.player || currentGame.player || null;
+        currentMatch.opponent = currentMatch.opponent || currentGame.opponent || null;
+    }
+
+    function recalculateMatchScore() {
+        if (!currentMatch) return;
+        let player = 0;
+        let opponent = 0;
+        for (const game of currentMatch.games || []) {
+            if (game.result === 'win') player++;
+            if (game.result === 'loss') opponent++;
+        }
+        currentMatch.score = { player, opponent };
+        if (player >= MAX_GAME_WINS || opponent >= MAX_GAME_WINS) {
+            currentMatch.status = 'finished';
+            currentMatch.result = player >= MAX_GAME_WINS ? 'win' : 'loss';
+        } else {
+            currentMatch.status = 'in_progress';
+            currentMatch.result = null;
+        }
+    }
+
+    function archiveCurrentMatch() {
+        if (!currentMatch) return;
+        ensureCurrentGameInMatch();
+        recalculateMatchScore();
+        currentMatch.updatedAt = nowISO();
+        const archive = loadArchive();
+        const index = archive.findIndex(m => m.localMatchId === currentMatch.localMatchId);
+        if (index >= 0) archive[index] = currentMatch;
+        else archive.push(currentMatch);
+        saveArchive(archive);
+        saveCurrent();
+        updatePanel();
+    }
+
+    function deleteCurrentFromArchive() {
+        if (!currentMatch) return;
+        saveArchive(loadArchive().filter(m => m.localMatchId !== currentMatch.localMatchId));
+    }
+
+    function startFreshMatch() {
+        if (currentMatch && currentMatch.games && currentMatch.games.length) {
+            archiveCurrentMatch();
+        }
+        currentMatch = createMatch();
+        currentGame = createGame(1);
+        currentMatch.games.push(currentGame);
+        playerName = null;
+        opponentName = null;
+        currentTurn = null;
+        turnAnchorBase = 0;
+        saveCurrent();
+        archiveCurrentMatch();
+        updatePanel();
+    }
+
+    function startNextGame() {
+        if (!currentMatch || currentMatch.status === 'finished') return false;
+        ensureCurrentGameInMatch();
+        recalculateMatchScore();
+        if (currentMatch.status === 'finished') return false;
+        const nextNumber = (currentMatch.games || []).length + 1;
+        if (nextNumber > 3) return false;
+        currentGame = createGame(nextNumber);
+        currentMatch.games.push(currentGame);
+        playerName = currentMatch.player || null;
+        opponentName = currentMatch.opponent || null;
+        currentTurn = null;
+        turnAnchorBase = 0;
+        saveCurrent();
+        archiveCurrentMatch();
+        updatePanel();
+        return true;
+    }
+
+    function saveCurrent() {
+        if (!currentMatch) return;
+        try {
+            ensureCurrentGameInMatch();
+            recalculateMatchScore();
+            localStorage.setItem(CURRENT_KEY, JSON.stringify(currentMatch));
+            flagSaveError(false);
+        } catch (e) {
+            console.error('[Endstep V4.9] Errore salvataggio match:', e);
+            flagSaveError(true);
+        }
+    }
+
+    function loadCurrent() {
+        return safeParse(localStorage.getItem(CURRENT_KEY), null);
+    }
+
+    function restoreOrCreateMatch() {
+        const saved = loadCurrent();
+        if (saved && Array.isArray(saved.games) && saved.status !== 'finished') {
+            restoredExistingSession = true;
+            currentMatch = saved;
+            matchCounter = Math.max(matchCounter, Number(saved.matchNumber) || 1);
+            const games = saved.games;
+            currentGame = games[games.length - 1] || createGame(1);
+            if (!games.length) currentMatch.games.push(currentGame);
+            gameCounter = Math.max(gameCounter, games.length);
+            playerName = currentMatch.player || currentGame.player || null;
+            opponentName = currentMatch.opponent || currentGame.opponent || null;
+            const lastTurn = [...currentGame.events].reverse().find(e => typeof e.turn === 'number');
+            currentTurn = lastTurn ? lastTurn.turn : null;
+            turnAnchorBase = Number(currentGame.turnAnchorBase) || 0;
+            console.log('[Endstep V4.9] Match BO3 ripristinato:', currentMatch.localMatchId);
+        } else {
+            if (saved) restoredExistingSession = true;
+            if (saved && saved.status === 'finished') {
+                matchCounter = Math.max(matchCounter, Number(saved.matchNumber) || 1);
+            }
+            currentMatch = createMatch();
+            currentGame = createGame(1);
+            currentMatch.games.push(currentGame);
+            saveCurrent();
+        }
+    }
+
+    /******************************************************************
+     * TURN PARSING
+     ******************************************************************/
+
+    /*
+     * FIX v4.6:
+     * L'attributo data-turn-anchor (o l'aria-label di fallback)
+     * NON contiene il numero di turno reale: contiene un ID
+     * interno opaco di Endstep (probabile chiave/contatore React,
+     * non resettato per partita), che produce numeri enormi e non
+     * sequenziali (es. 23, 42, 700, 783 su una singola partita).
+     *
+     * Il numero di turno corretto è invece la POSIZIONE ORDINALE
+     * dell'anchor nel log (1° anchor incontrato = turno 1, 2°
+     * anchor = turno 2, ecc.), non la cifra nascosta nel suo
+     * attributo. parseTurnAnchor() non serve più ed è stata
+     * rimossa: il conteggio ora si basa solo sull'indice
+     * dell'anchor nell'array ordinato per posizione nel DOM.
+     */
+    function getGlobalTurnOrdinal(element) {
+        if (!logContainer || !element) return null;
+        const anchors = [...logContainer.querySelectorAll('[data-turn-anchor]')];
+        let closestOrdinal = null;
+        for (let i = 0; i < anchors.length; i++) {
+            const anchor = anchors[i];
+            const relation = anchor.compareDocumentPosition(element);
+            if (relation & Node.DOCUMENT_POSITION_FOLLOWING) {
+                closestOrdinal = i + 1;
+                continue;
+            }
+            if (relation & Node.DOCUMENT_POSITION_PRECEDING) break;
+        }
+        return closestOrdinal;
+    }
+
+    function getAnchorCountBeforeElement(element) {
+        if (!logContainer || !element) return 0;
+        const anchors = [...logContainer.querySelectorAll('[data-turn-anchor]')];
+        let count = 0;
+        for (const anchor of anchors) {
+            const relation = anchor.compareDocumentPosition(element);
+            if (relation & Node.DOCUMENT_POSITION_FOLLOWING) count++;
+            else if (relation & Node.DOCUMENT_POSITION_PRECEDING) break;
+        }
+        return count;
+    }
+
+    function getTurnForElement(element) {
+        if (!logContainer || !element) return currentTurn;
+        const globalOrdinal = getGlobalTurnOrdinal(element);
+        if (globalOrdinal === null) return currentTurn;
+        const relativeTurn = Math.max(1, globalOrdinal - turnAnchorBase);
+        currentTurn = relativeTurn;
+        if (currentGame) currentGame.turnAnchorBase = turnAnchorBase;
+        return relativeTurn;
+    }
+
+    /******************************************************************
+     * PLAYER PARSING
+     ******************************************************************/
+
+    function detectPlayerFromLabel(label) {
+        label = normalizeText(label);
+
+        if (!label) {
+            return {
+                side: null,
+                player: null
+            };
+        }
+
+        /*
+         * Esempio:
+         * You: dicli played Forest
+         */
+        if (/^You:/i.test(label)) {
+            let name = null;
+
+            const afterYou = label.replace(/^You:\s*/i, '');
+
+            const match = afterYou.match(
+                /^([A-Za-z0-9_#.-]+)\s+(?:played|cast|activated|attacked|declared|triggered|drew|discarded|sacrificed|mulliganed|has|kept|looked|revealed|put|returned|gained|lost|created|exiled|destroyed|conceded|passed)\b/i
+            );
+
+            if (match) {
+                name = match[1];
+            }
+
+            if (!name && currentGame.player) {
+                name = currentGame.player;
+            }
+
+            return {
+                side: 'you',
+                player: name
+            };
+        }
+
+        /*
+         * Esempio:
+         * Opponent TechyBagel: TechyBagel's life: 23 -> 20
+         */
+        const opponentMatch = label.match(
+            /^Opponent\s+([^:]+):/i
+        );
+
+        if (opponentMatch) {
+            const name = normalizeText(opponentMatch[1]);
+
+            return {
+                side: 'opponent',
+                player: name
+            };
+        }
+
+        /*
+         * Alcuni eventi hanno:
+         *
+         * : dicli has kept a hand of 6 cards
+         *
+         * oppure:
+         *
+         * : Twisted Landscape: Battlefield -> Graveyard
+         *
+         * In questi casi cerchiamo di associare il nome se possibile.
+         */
+
+        if (currentGame.player) {
+            const escaped = currentGame.player.replace(
+                /[.*+?^${}()|[\]\\]/g,
+                '\\$&'
+            );
+
+            if (new RegExp(`\\b${escaped}\\b`, 'i').test(label)) {
+                return {
+                    side: 'you',
+                    player: currentGame.player
+                };
+            }
+        }
+
+        if (currentGame.opponent) {
+            const escaped = currentGame.opponent.replace(
+                /[.*+?^${}()|[\]\\]/g,
+                '\\$&'
+            );
+
+            if (new RegExp(`\\b${escaped}\\b`, 'i').test(label)) {
+                return {
+                    side: 'opponent',
+                    player: currentGame.opponent
+                };
+            }
+        }
+
+        return {
+            side: null,
+            player: null
+        };
+    }
+
+    /******************************************************************
+     * EVENT TYPE
+     ******************************************************************/
+
+    function getEventType(element, ariaLabel, text) {
+        const classes = String(element.className || '');
+
+        if (/game started/i.test(ariaLabel)) {
+            return 'game_start';
+        }
+
+        if (/mulligan/i.test(ariaLabel)) {
+            return 'mulligan';
+        }
+
+        if (/kept a hand/i.test(ariaLabel)) {
+            return 'keep_hand';
+        }
+
+        if (/life:/i.test(ariaLabel)) {
+            return 'life';
+        }
+
+        if (/combat damage/i.test(ariaLabel)) {
+            return 'combat_damage';
+        }
+
+        if (/got \d+ \+1\/\+1 counter/i.test(ariaLabel)) {
+            return 'counter';
+        }
+
+        if (/->/i.test(ariaLabel) && /Battlefield|Graveyard|Hand|Exile|Library/i.test(ariaLabel)) {
+            return 'zone_change';
+        }
+
+        if (/cast /i.test(ariaLabel)) {
+            return 'cast';
+        }
+
+        if (/played /i.test(ariaLabel)) {
+            return 'play_land';
+        }
+
+        if (/triggered /i.test(ariaLabel)) {
+            return 'trigger';
+        }
+
+        if (/attacked/i.test(ariaLabel)) {
+            return 'attack';
+        }
+
+        if (/block/i.test(ariaLabel)) {
+            return 'block';
+        }
+
+        if (/drew/i.test(ariaLabel)) {
+            return 'draw';
+        }
+
+        if (/discard/i.test(ariaLabel)) {
+            return 'discard';
+        }
+
+        if (/sacrific/i.test(ariaLabel)) {
+            return 'sacrifice';
+        }
+
+        if (/exiled/i.test(ariaLabel)) {
+            return 'exile';
+        }
+
+        if (/destroyed/i.test(ariaLabel)) {
+            return 'destroy';
+        }
+
+        if (/conced/i.test(ariaLabel)) {
+            return 'concede';
+        }
+
+        if (/reveal|look at .*hand/i.test(ariaLabel)) {
+            return 'reveal';
+        }
+
+        if (classes.includes('gl-row-life')) {
+            return 'life';
+        }
+
+        if (classes.includes('gl-row-damage')) {
+            return 'combat_damage';
+        }
+
+        if (classes.includes('gl-row-counter')) {
+            return 'counter';
+        }
+
+        if (classes.includes('gl-row-land')) {
+            return 'play_land';
+        }
+
+        if (classes.includes('gl-row-reveal')) {
+            return 'reveal';
+        }
+
+        if (classes.includes('gl-row-spell')) {
+            return 'spell';
+        }
+
+        return 'other';
+    }
+
+    /******************************************************************
+     * CARD EXTRACTION
+     ******************************************************************/
+
+    function extractCards(element) {
+        const cards = [];
+
+        element.querySelectorAll(
+            '.gl-card-name, [aria-label^="Preview "]'
+        ).forEach(node => {
+            let name = node.textContent || '';
+
+            const aria = node.getAttribute('aria-label') || '';
+
+            if (/^Preview /i.test(aria)) {
+                name = aria.replace(/^Preview\s+/i, '');
+            }
+
+            name = normalizeText(name);
+
+            if (name && !cards.includes(name)) {
+                cards.push(name);
+            }
+        });
+
+        /*
+         * Fallback: nomi evidenti presenti nell'aria-label
+         * vengono lasciati nel raw event anche se non riconosciuti.
+         */
+
+        return cards;
+    }
+
+    /******************************************************************
+     * STRUCTURED DETAILS
+     ******************************************************************/
+
+    function parseDetails(type, ariaLabel) {
+        const details = {};
+
+        if (type === 'life') {
+            const match = ariaLabel.match(
+                /life:\s*(-?\d+)\s*->\s*(-?\d+)/i
+            );
+
+            if (match) {
+                details.lifeFrom = Number(match[1]);
+                details.lifeTo = Number(match[2]);
+                details.lifeChange =
+                    details.lifeTo - details.lifeFrom;
+            }
+        }
+
+        if (type === 'combat_damage') {
+            const match = ariaLabel.match(
+                /Combat damage:\s*([^0-9]+)\s*(\d+)/i
+            );
+
+            if (match) {
+                details.damagePlayer =
+                    normalizeText(match[1]);
+
+                details.damageAmount =
+                    Number(match[2]);
+            }
+        }
+
+        if (type === 'counter') {
+            const match = ariaLabel.match(
+                /got\s+(\d+)\s+\+1\/\+1 counter\(s\)\s+\((\d+) total\)/i
+            );
+
+            if (match) {
+                details.counterAdded =
+                    Number(match[1]);
+
+                details.counterTotal =
+                    Number(match[2]);
+            }
+        }
+
+        if (type === 'zone_change') {
+            const match = ariaLabel.match(
+                /:\s*([^:]+):\s*([^>]+)->\s*(.+)$/i
+            );
+
+            if (match) {
+                details.card =
+                    normalizeText(match[1]);
+
+                details.fromZone =
+                    normalizeText(match[2]);
+
+                details.toZone =
+                    normalizeText(match[3]);
+            }
+        }
+
+        if (type === 'game_start') {
+            const match = ariaLabel.match(
+                /Game started\.\s+(.+?)\s+goes first/i
+            );
+
+            if (match) {
+                details.firstPlayer =
+                    normalizeText(match[1]);
+            }
+        }
+
+        return details;
+    }
+
+    /******************************************************************
+     * EVENT FINGERPRINT
+     ******************************************************************/
+
+    function fingerprintEvent(event) {
+        return [
+            event.type,
+            event.ariaLabel,
+            event.text,
+            event.turn
+        ].join('|');
+    }
+
+    function eventAlreadyExists(event) {
+        if (!currentGame) return false;
+
+        const fp = fingerprintEvent(event);
+
+        return currentGame.events.some(
+            e => fingerprintEvent(e) === fp
+        );
+    }
+
+    /******************************************************************
+     * BUILD EVENT
+     ******************************************************************/
+
+    function buildEvent(element, forcedType = null) {
+        const ariaLabel =
+            normalizeText(
+                element.getAttribute('aria-label') || ''
+            );
+
+        const text =
+            normalizeText(
+                element.textContent || ''
+            );
+
+        const type =
+            forcedType ||
+            getEventType(
+                element,
+                ariaLabel,
+                text
+            );
+
+        const actor =
+            detectPlayerFromLabel(ariaLabel);
+
+        const turn =
+            getTurnForElement(element);
+
+        const event = {
+            id: generateGameId(),
+
+            timestamp: nowISO(),
+
+            turn:
+                turn === undefined
+                    ? null
+                    : turn,
+
+            type,
+
+            side: actor.side,
+
+            player: actor.player,
+
+            ariaLabel,
+
+            text,
+
+            cards: extractCards(element),
+
+            classes: String(
+                element.className || ''
+            ),
+
+            details:
+                parseDetails(
+                    type,
+                    ariaLabel
+                )
+        };
+
+        return event;
+    }
+
+    /******************************************************************
+     * UPDATE PLAYERS
+     ******************************************************************/
+
+    function updateGamePlayers(event) {
+        if (!currentGame) return;
+
+        if (
+            event.side === 'you' &&
+            event.player
+        ) {
+            if (!currentGame.player) {
+                currentGame.player =
+                    event.player;
+            }
+
+            playerName =
+                currentGame.player;
+        }
+
+        if (
+            event.side === 'opponent' &&
+            event.player
+        ) {
+            if (!currentGame.opponent) {
+                currentGame.opponent =
+                    event.player;
+            }
+
+            opponentName =
+                currentGame.opponent;
+        }
+
+        /*
+         * Game Start può dirci chi inizia.
+         */
+        if (
+            event.type === 'game_start' &&
+            event.details &&
+            event.details.firstPlayer
+        ) {
+            currentGame.firstPlayer =
+                event.details.firstPlayer;
+
+            /*
+             * Se coincide con il nostro nome,
+             * sappiamo che siamo noi.
+             */
+            if (
+                currentGame.player &&
+                event.details.firstPlayer ===
+                currentGame.player
+            ) {
+                currentGame.firstPlayer =
+                    currentGame.player;
+            }
+        }
+    }
+
+    /******************************************************************
+     * RESULT DETECTION
+     ******************************************************************/
+
+    function detectResult(ariaLabel, text) {
+        /*
+         * FIX v4.8:
+         * Quando la partita finisce per vita a 0 (non per resa),
+         * Endstep scrive una riga esplicita nel formato:
+         *   "You: Winner: <tuo nome>"        -> vittoria
+         *   "Opponent <nome>: Winner: <nome>" -> sconfitta
+         * seguita da ": Game finished". Questo pattern è più
+         * affidabile dei precedenti perché riusa lo stesso
+         * prefisso You:/Opponent <nome>: già usato ovunque nel
+         * parser, quindi lo controlliamo per primo e sul solo
+         * ariaLabel (non serve il testo normalizzato "combined").
+         */
+        if (/^You:\s*Winner:/i.test(ariaLabel)) {
+            return 'win';
+        }
+
+        if (/^Opponent\s+[^:]+:\s*Winner:/i.test(ariaLabel)) {
+            return 'loss';
+        }
+
+        const combined =
+            `${ariaLabel} ${text}`.toLowerCase();
+
+        /*
+         * Non assumiamo che Endstep mostri sempre queste stringhe.
+         * Se compaiono, però, le interpretiamo.
+         */
+
+        if (
+            /\byou (won|win|have won)\b/.test(combined) ||
+            /\byou win\b/.test(combined) ||
+            /\byou won\b/.test(combined)
+        ) {
+            return 'win';
+        }
+
+        if (
+            /\byou (lost|lose|have lost)\b/.test(combined) ||
+            /\byou lose\b/.test(combined) ||
+            /\byou lost\b/.test(combined)
+        ) {
+            return 'loss';
+        }
+
+        if (
+            /\b(opponent|they) (won|win|have won)\b/.test(combined)
+        ) {
+            return 'loss';
+        }
+
+        if (
+            /\b(opponent|they) (lost|lose|have lost)\b/.test(combined)
+        ) {
+            return 'win';
+        }
+
+        if (/conceded/i.test(combined)) {
+            if (
+                currentGame.player &&
+                combined.includes(
+                    currentGame.player.toLowerCase()
+                )
+            ) {
+                return 'loss';
+            }
+
+            return 'win';
+        }
+
+        return null;
+    }
+
+    /******************************************************************
+     * PROCESS EVENT
+     ******************************************************************/
+
+    function processElement(element, options = {}) {
+        if (!element || !currentGame || !currentMatch) return;
+        const { allowGameSplit = false } = options;
+        const ariaLabel = normalizeText(element.getAttribute('aria-label') || '');
+        const text = normalizeText(element.textContent || '');
+        if (!ariaLabel && !text) return;
+
+        const type = getEventType(element, ariaLabel, text);
+
+        if (type === 'game_start' && currentGame.events.length > 0 &&
+            (allowGameSplit || currentGame.status === 'finished')) {
+            ensureCurrentGameInMatch();
+            recalculateMatchScore();
+            if (currentMatch.status === 'finished') {
+                console.log('[Endstep V4.9] Match già concluso: ignoro un Game Start successivo.');
+                return;
+            }
+            console.log('[Endstep V4.9] Nuovo Game Start: apro Game ' + ((currentMatch.games || []).length + 1));
+            if (!startNextGame()) return;
+            // L'anchor del Game Start precede normalmente il primo turn anchor.
+            // Salviamo qui il numero globale di anchor già presenti, così T1 resta relativo al nuovo game.
+            turnAnchorBase = getAnchorCountBeforeElement(element);
+            currentGame.turnAnchorBase = turnAnchorBase;
+        }
+
+        // Il Game Start del primo game stabilisce la base degli anchor.
+        if (type === 'game_start' && currentGame.events.length === 0) {
+            turnAnchorBase = getAnchorCountBeforeElement(element);
+            currentGame.turnAnchorBase = turnAnchorBase;
+        }
+
+        const event = buildEvent(element, type);
+        if (eventAlreadyExists(event)) return;
+
+        updateGamePlayers(event);
+
+        const detectedResult = detectResult(event.ariaLabel, event.text);
+        if (detectedResult) {
+            currentGame.result = detectedResult;
+            currentGame.status = 'finished';
+        } else if (/now controlled by/i.test(event.ariaLabel) && currentGame.status !== 'finished') {
+            currentGame.status = 'finished';
+            console.log('[Endstep V4.9] Fine Game rilevata senza vincitore esplicito: usa Vittoria/Sconfitta.');
+        }
+
+        // Life a 0 è un fallback affidabile per i game terminati per danno/lethal.
+        if (!detectedResult && event.type === 'life' &&
+            typeof event.details.lifeTo === 'number' && event.details.lifeTo <= 0 &&
+            !currentGame.result) {
+            if (event.side === 'you') currentGame.result = 'loss';
+            else if (event.side === 'opponent') currentGame.result = 'win';
+            if (currentGame.result) currentGame.status = 'finished';
+        }
+
+        currentGame.events.push(event);
+        currentGame.updatedAt = nowISO();
+
+        const turns = currentGame.events.map(e => e.turn).filter(t => typeof t === 'number' && !Number.isNaN(t));
+        if (turns.length) currentGame.turns = Math.max(...turns);
+
+        ensureCurrentGameInMatch();
+        recalculateMatchScore();
+        saveCurrent();
+        archiveCurrentMatch();
+        updatePanel();
+
+        console.log('[Endstep V4.9] Evento salvato:', event);
+
+        // Se il Game ha chiuso il BO3, il Match resta chiuso e non verrà creato G4.
+        if (currentGame.status === 'finished' && currentGame.result && currentMatch.status === 'finished') {
+            console.log('[Endstep V4.9] MATCH FINITO:', currentMatch.result, `${currentMatch.score.player}-${currentMatch.score.opponent}`);
+        }
+    }
+
+    /******************************************************************
+     * LOG SCAN
+     ******************************************************************/
+
+    function markExistingLogNodesAsKnown() {
+        if (!logContainer) return;
+        logContainer.querySelectorAll('.gl-row').forEach(row => knownRows.add(row));
+        logContainer.querySelectorAll('.gl-phase').forEach(phase => knownPhases.add(phase));
+    }
+
+    function scanExistingLog() {
+        if (!logContainer) return;
+
+        /*
+         * Questa scansione iniziale passa allowGameSplit: false
+         * (per non spezzare un semplice refresh a metà partita),
+         * ma lo split "forzato" su partita già conclusa dentro
+         * processElement() resta comunque attivo: vedi il fix
+         * v4.4 in processElement().
+         */
+
+        const elements = [
+            ...logContainer.querySelectorAll(
+                '.gl-row, .gl-phase'
+            )
+        ];
+
+        for (const element of elements) {
+            if (
+                element.matches('.gl-phase')
+            ) {
+                if (!knownPhases.has(element)) {
+                    knownPhases.add(element);
+
+                    processElement(
+                        element,
+                        {
+                            allowGameSplit: false
+                        }
+                    );
+                }
+
+                continue;
+            }
+
+            if (
+                element.matches('.gl-row')
+            ) {
+                if (!knownRows.has(element)) {
+                    knownRows.add(element);
+
+                    processElement(
+                        element,
+                        {
+                            allowGameSplit: false
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    /******************************************************************
+     * MUTATION OBSERVER
+     ******************************************************************/
+
+    function observeLog() {
+        if (!logContainer) return;
+
+        if (observer) {
+            observer.disconnect();
+        }
+
+        observer =
+            new MutationObserver(
+                mutations => {
+                    for (const mutation of mutations) {
+                        /*
+                         * Nuovi nodi
+                         */
+                        for (
+                            const node of mutation.addedNodes
+                        ) {
+                            if (
+                                node.nodeType !==
+                                Node.ELEMENT_NODE
+                            ) {
+                                continue;
+                            }
+
+                            /*
+                             * Il nodo stesso può essere una row
+                             */
+                            if (
+                                node.matches &&
+                                node.matches('.gl-row')
+                            ) {
+                                if (
+                                    !knownRows.has(node)
+                                ) {
+                                    knownRows.add(node);
+
+                                    processElement(
+                                        node,
+                                        {
+                                            allowGameSplit:
+                                                initialized
+                                        }
+                                    );
+                                }
+                            }
+
+                            /*
+                             * Oppure può contenere diverse row
+                             */
+                            if (
+                                node.querySelectorAll
+                            ) {
+                                const rows =
+                                    node.querySelectorAll(
+                                        '.gl-row'
+                                    );
+
+                                for (
+                                    const row of rows
+                                ) {
+                                    if (
+                                        !knownRows.has(row)
+                                    ) {
+                                        knownRows.add(row);
+
+                                        processElement(
+                                            row,
+                                            {
+                                                allowGameSplit:
+                                                    initialized
+                                            }
+                                        );
+                                    }
+                                }
+
+                                const phases =
+                                    node.querySelectorAll(
+                                        '.gl-phase'
+                                    );
+
+                                for (
+                                    const phase of phases
+                                ) {
+                                    if (
+                                        !knownPhases.has(
+                                            phase
+                                        )
+                                    ) {
+                                        knownPhases.add(
+                                            phase
+                                        );
+
+                                        processElement(
+                                            phase,
+                                            {
+                                                allowGameSplit:
+                                                    false
+                                            }
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        /*
+                         * Se il contenuto del log viene completamente
+                         * ricreato, controlliamo periodicamente
+                         * il container.
+                         */
+                    }
+                }
+            );
+
+        observer.observe(
+            logContainer,
+            {
+                childList: true,
+                subtree: true,
+                characterData: true
+            }
+        );
+    }
+
+    /******************************************************************
+     * FIND LOG
+     ******************************************************************/
+
+    function findLog() {
+        const newContainer =
+            document.querySelector(
+                '[data-gamelog-panel] [role="log"]'
+            ) ||
+            document.querySelector(
+                '[data-gamelog-body] [role="log"]'
+            );
+
+        if (!newContainer) {
+            return;
+        }
+
+        /*
+         * Primo ritrovamento.
+         */
+        if (!logContainer) {
+            logContainer =
+                newContainer;
+
+            console.log(
+                '[Endstep V4.9] Game Log trovato.'
+            );
+
+            if (restoredExistingSession) {
+                // Il current salvato contiene già gli eventi acquisiti prima del refresh.
+                // Non riscansioniamo il vecchio DOM, altrimenti gli eventi dei Game precedenti
+                // potrebbero finire nel Game corrente. Il MutationObserver catturerà solo i nodi nuovi.
+                // Se Endstep ha ricreato il log mostrando solo il Game corrente, la base globale
+                // precedente non è più valida: in quel caso ripartiamo da 0.
+                const anchorCount = logContainer.querySelectorAll('[data-turn-anchor]').length;
+                if (turnAnchorBase >= anchorCount && anchorCount > 0) {
+                    turnAnchorBase = 0;
+                    currentGame.turnAnchorBase = 0;
+                }
+                markExistingLogNodesAsKnown();
+            } else {
+                scanExistingLog();
+            }
+            observeLog();
+
+            initialized = true;
+
+            updatePanel();
+
+            return;
+        }
+
+        /*
+         * Il container è cambiato.
+         *
+         * Non splittiamo automaticamente qui: Endstep può
+         * ricreare il DOM per vari motivi. La nuova partita viene
+         * identificata principalmente dal nuovo Game Start aggiunto
+         * durante la sessione (o dallo split forzato se la
+         * partita corrente è già conclusa).
+         */
+        if (
+            newContainer !==
+            logContainer
+        ) {
+            console.log(
+                '[Endstep V4.9] Game Log DOM ricreato.'
+            );
+
+            if (observer) {
+                observer.disconnect();
+            }
+
+            logContainer =
+                newContainer;
+
+            knownRows =
+                new WeakSet();
+
+            knownPhases =
+                new WeakSet();
+
+            scanExistingLog();
+            observeLog();
+
+            updatePanel();
+        }
+    }
+
+    /******************************************************************
+     * PANEL
+     ******************************************************************/
+
+    function loadPanelPosition() {
+        return safeParse(
+            localStorage.getItem(
+                POSITION_KEY
+            ),
+            {
+                left: '20px',
+                top: null,
+                bottom: '20px'
+            }
+        );
+    }
+
+    function savePanelPosition(panel) {
+        const rect =
+            panel.getBoundingClientRect();
+
+        const position = {
+            left: `${rect.left}px`,
+            top: `${rect.top}px`,
+            bottom: null
+        };
+
+        try {
+            localStorage.setItem(
+                POSITION_KEY,
+                JSON.stringify(position)
+            );
+        } catch (e) {}
+    }
+
+    function createPanel() {
+        if (document.getElementById(PANEL_ID)) return;
+        const panel = document.createElement('div');
+        panel.id = PANEL_ID;
+        const position = loadPanelPosition();
+        panel.style.position = 'fixed';
+        panel.style.left = position.left || '20px';
+        if (position.top) panel.style.top = position.top;
+        else panel.style.bottom = position.bottom || '20px';
+        panel.style.zIndex = '999999';
+        panel.style.width = '350px';
+        panel.style.background = '#1e1e1e';
+        panel.style.color = '#fff';
+        panel.style.border = '1px solid #555';
+        panel.style.borderRadius = '8px';
+        panel.style.boxShadow = '0 5px 20px rgba(0,0,0,.45)';
+        panel.style.fontFamily = 'Arial, sans-serif';
+        panel.style.fontSize = '13px';
+        panel.style.userSelect = 'none';
+        panel.innerHTML = `
+            <div id="${PANEL_ID}-header" style="padding:10px;cursor:move;background:#292929;border-radius:8px 8px 0 0;font-weight:bold;display:flex;justify-content:space-between;align-items:center;">
+                <span>🧠 Endstep AI Tracker V4.9</span>
+                <span id="${PANEL_ID}-status" style="font-size:11px;color:#8f8;">● ACTIVE</span>
+            </div>
+            <div style="padding:10px;">
+                <div id="${PANEL_ID}-info" style="line-height:1.5;margin-bottom:8px;color:#ddd;"></div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;">
+                    <button id="${PANEL_ID}-json">💾 Match JSON</button>
+                    <button id="${PANEL_ID}-new">🆕 Nuovo Match</button>
+                    <button id="${PANEL_ID}-win">🏆 Game WIN</button>
+                    <button id="${PANEL_ID}-loss">💀 Game LOSS</button>
+                    <button id="${PANEL_ID}-archive" style="grid-column:1 / span 2;">📦 Esporta archivio</button>
+                </div>
+                <div id="${PANEL_ID}-saved" style="margin-top:8px;color:#aaa;font-size:11px;"></div>
+            </div>`;
+        document.body.appendChild(panel);
+
+        panel.querySelectorAll('button').forEach(btn => {
+            btn.style.background = '#333'; btn.style.color = '#fff'; btn.style.border = '1px solid #666';
+            btn.style.borderRadius = '5px'; btn.style.padding = '7px'; btn.style.cursor = 'pointer';
+            btn.addEventListener('mouseenter', () => btn.style.background = '#444');
+            btn.addEventListener('mouseleave', () => btn.style.background = '#333');
+        });
+
+        panel.querySelector(`#${PANEL_ID}-json`).onclick = () => {
+            if (!currentMatch) return;
+            downloadJSON(currentMatch, `endstep_match_${currentMatch.matchNumber}_${currentMatch.localMatchId}.json`);
+        };
+
+        panel.querySelector(`#${PANEL_ID}-new`).onclick = () => {
+            if (!confirm('Archiviare il Match corrente e iniziarne uno nuovo?')) return;
+            startFreshMatch();
+        };
+
+        panel.querySelector(`#${PANEL_ID}-win`).onclick = () => {
+            setCurrentGameResult('win');
+        };
+
+        panel.querySelector(`#${PANEL_ID}-loss`).onclick = () => {
+            setCurrentGameResult('loss');
+        };
+
+        panel.querySelector(`#${PANEL_ID}-archive`).onclick = () => {
+            downloadJSON(loadArchive(), `endstep_matches_v49_${Date.now()}.json`);
+        };
+
+        makeDraggable(panel, panel.querySelector(`#${PANEL_ID}-header`));
+    }
+
+    function setCurrentGameResult(result) {
+        if (!currentGame || !currentMatch) return;
+        currentGame.result = result;
+        currentGame.status = 'finished';
+        ensureCurrentGameInMatch();
+        recalculateMatchScore();
+        saveCurrent();
+        archiveCurrentMatch();
+        updatePanel();
+        console.log('[Endstep V4.9] Game', currentGame.gameNumber, 'risultato manuale:', result,
+            'Score:', currentMatch.score.player + '-' + currentMatch.score.opponent);
+    }
+
+    /******************************************************************
+     * DRAG
+     ******************************************************************/
+
+    function makeDraggable(
+        panel,
+        handle
+    ) {
+        let dragging = false;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        handle.addEventListener(
+            'mousedown',
+            e => {
+                dragging = true;
+
+                const rect =
+                    panel.getBoundingClientRect();
+
+                offsetX =
+                    e.clientX -
+                    rect.left;
+
+                offsetY =
+                    e.clientY -
+                    rect.top;
+
+                panel.style.bottom =
+                    'auto';
+
+                document.body.style.userSelect =
+                    'none';
+            }
+        );
+
+        document.addEventListener(
+            'mousemove',
+            e => {
+                if (!dragging) return;
+
+                panel.style.left =
+                    `${e.clientX - offsetX}px`;
+
+                panel.style.top =
+                    `${e.clientY - offsetY}px`;
+            }
+        );
+
+        document.addEventListener(
+            'mouseup',
+            () => {
+                if (!dragging) return;
+
+                dragging = false;
+
+                document.body.style.userSelect =
+                    '';
+
+                savePanelPosition(
+                    panel
+                );
+            }
+        );
+    }
+
+    /******************************************************************
+     * PANEL UPDATE
+     ******************************************************************/
+
+    let saveErrorFlag = false;
+
+    function flagSaveError(hasError) {
+        saveErrorFlag = hasError;
+    }
+
+    function updatePanel() {
+        const panel = document.getElementById(PANEL_ID);
+        if (!panel) return;
+        const info = panel.querySelector(`#${PANEL_ID}-info`);
+        const saved = panel.querySelector(`#${PANEL_ID}-saved`);
+        const status = panel.querySelector(`#${PANEL_ID}-status`);
+        if (status) {
+            if (saveErrorFlag) { status.textContent = '● SAVE ERROR'; status.style.color = '#f88'; }
+            else if (currentMatch && currentMatch.status === 'finished') { status.textContent = '● MATCH FINITO'; status.style.color = '#fc8'; }
+            else { status.textContent = '● ACTIVE'; status.style.color = '#8f8'; }
+        }
+        if (!currentMatch || !currentGame) {
+            info.innerHTML = 'Nessun Match attivo.';
+            return;
+        }
+        const score = currentMatch.score || { player: 0, opponent: 0 };
+        const gameResult = currentGame.result ? currentGame.result.toUpperCase() : '—';
+        const matchResult = currentMatch.result ? currentMatch.result.toUpperCase() : '—';
+        const gamesDone = (currentMatch.games || []).length;
+        info.innerHTML = `
+            <b>Match:</b> #${currentMatch.matchNumber} (${escapeHTML(currentMatch.format)})<br>
+            <b>Score:</b> ${score.player} - ${score.opponent}<br>
+            <b>Game:</b> ${currentGame.gameNumber} / 3<br>
+            <b>Stato Game:</b> ${escapeHTML(currentGame.status)}<br>
+            <b>Stato Match:</b> ${escapeHTML(currentMatch.status)}<br>
+            <b>Tu:</b> ${escapeHTML(currentMatch.player || currentGame.player || '—')}<br>
+            <b>Avversario:</b> ${escapeHTML(currentMatch.opponent || currentGame.opponent || '—')}<br>
+            <b>Turno:</b> ${currentGame.turns || '—'}<br>
+            <b>Eventi:</b> ${currentGame.events.length}<br>
+            <b>Risultato Game:</b> ${gameResult}<br>
+            <b>Risultato Match:</b> ${matchResult}<br>
+            <b>Game acquisiti:</b> ${gamesDone}
+        `;
+        saved.textContent = saveErrorFlag
+            ? '⚠️ Errore di salvataggio! Controlla lo spazio di localStorage.'
+            : `💾 Salvato automaticamente • Archivio: ${getArchiveCount()} match • ${new Date().toLocaleTimeString()}`;
+    }
+
+    function escapeHTML(value) {
+        return String(value || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    /******************************************************************
+     * DOWNLOAD
+     ******************************************************************/
+
+    function downloadJSON(
+        data,
+        filename
+    ) {
+        const blob =
+            new Blob(
+                [
+                    JSON.stringify(
+                        data,
+                        null,
+                        2
+                    )
+                ],
+                {
+                    type:
+                        'application/json'
+                }
+            );
+
+        const url =
+            URL.createObjectURL(
+                blob
+            );
+
+        const a =
+            document.createElement(
+                'a'
+            );
+
+        a.href = url;
+        a.download = filename;
+
+        document.body.appendChild(a);
+
+        a.click();
+
+        a.remove();
+
+        setTimeout(
+            () =>
+                URL.revokeObjectURL(url),
+            1000
+        );
+    }
+
+    /******************************************************************
+     * PERIODIC CHECK
+     ******************************************************************/
+
+    function mainLoop() {
+        findLog();
+        createPanel();
+        updatePanel();
+    }
+
+    /******************************************************************
+     * START
+     ******************************************************************/
+
+    console.log(
+        '%c[Endstep AI Tracker V4.9] avvio...',
+        'color:#8f8;font-weight:bold;'
+    );
+
+    restoreOrCreateMatch();
+
+    setInterval(
+        mainLoop,
+        1000
+    );
+
+    mainLoop();
+
+})();
